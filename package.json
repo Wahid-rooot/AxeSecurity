@@ -1,0 +1,16 @@
+{
+  "name": "axesecurity",
+  "version": "1.0.0",
+  "description": "AxeSecurity — Advanced anti-nuke bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

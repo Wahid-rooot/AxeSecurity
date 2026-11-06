@@ -10,15 +10,15 @@ const {
 // CONFIG
 // ============================================================
 const CONFIG = {
-    LOG_CHANNEL_ID:       process.env.LOG_CHANNEL_ID       || 'YOUR_LOG_CHANNEL_ID',
-    EMERGENCY_ROLE_ID:    process.env.EMERGENCY_ROLE_ID    || 'YOUR_EMERGENCY_ROLE_ID',
-    AUTOROLE_ID:          process.env.AUTOROLE_ID          || 'YOUR_AUTOROLE_ID',
-    PUNISHMENT:           process.env.PUNISHMENT           || 'ban', // ban | kick | strip
+    LOG_CHANNEL_ID:    process.env.LOG_CHANNEL_ID    || '',
+    EMERGENCY_ROLE_ID: process.env.EMERGENCY_ROLE_ID || '',
+    AUTOROLE_ID:       process.env.AUTOROLE_ID       || '',
+    PUNISHMENT:        process.env.PUNISHMENT        || 'ban', // ban | kick | strip
 
     ABSOLUTE_IMMUNE: new Set(
         (process.env.ABSOLUTE_IMMUNE || '').split(',').filter(Boolean)
     ),
-    WHITELISTED_USERS: new Set(
+    ENV_WHITELISTED_USERS: new Set(
         (process.env.WHITELISTED_USERS || '').split(',').filter(Boolean)
     ),
 
@@ -50,7 +50,7 @@ const CONFIG = {
 };
 
 // ============================================================
-// FEATURES REGISTRY + PERSISTENCE
+// FEATURES REGISTRY
 // ============================================================
 const FEATURES = {
     antinuke:          { label: 'Anti-Nuke Core',          default: true  },
@@ -65,7 +65,10 @@ const FEATURES = {
     antiChannelSpam:   { label: 'Anti Channel Spam',       default: true  },
 };
 
-const SETTINGS_FILE = path.join(__dirname, 'settings.json');
+// ============================================================
+// PERSISTENCE (settings.json)
+// ============================================================
+const SETTINGS_FILE = process.env.SETTINGS_PATH || path.join(__dirname, 'settings.json');
 let cache = {};
 
 function loadSettings() {
@@ -73,12 +76,18 @@ function loadSettings() {
         if (fs.existsSync(SETTINGS_FILE)) {
             cache = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
         }
-    } catch (e) { console.error('[settings] load failed:', e); cache = {}; }
+    } catch (e) {
+        console.error('[settings] load failed:', e);
+        cache = {};
+    }
 }
 
 function saveSettings() {
-    try { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(cache, null, 2)); }
-    catch (e) { console.error('[settings] save failed:', e); }
+    try {
+        fs.writeFileSync(SETTINGS_FILE, JSON.stringify(cache, null, 2));
+    } catch (e) {
+        console.error('[settings] save failed:', e);
+    }
 }
 
 function getGuild(guildId) {
@@ -87,6 +96,8 @@ function getGuild(guildId) {
     for (const key of Object.keys(FEATURES)) {
         if (typeof g[key] !== 'boolean') g[key] = FEATURES[key].default;
     }
+    if (!Array.isArray(g.whitelist)) g.whitelist = [];
+    if (!Array.isArray(g.whitelistRoles)) g.whitelistRoles = [];
     return g;
 }
 
@@ -110,13 +121,84 @@ function panicDisableAll(guildId) {
     return g;
 }
 
+// ---------- USER WHITELIST ----------
+function getWhitelist(guildId) {
+    return getGuild(guildId).whitelist;
+}
+
+function addWhitelist(guildId, userId) {
+    const wl = getWhitelist(guildId);
+    if (!wl.includes(userId)) {
+        wl.push(userId);
+        saveSettings();
+        return true;
+    }
+    return false;
+}
+
+function removeWhitelist(guildId, userId) {
+    const g = getGuild(guildId);
+    const before = g.whitelist.length;
+    g.whitelist = g.whitelist.filter(id => id !== userId);
+    if (g.whitelist.length < before) {
+        saveSettings();
+        return true;
+    }
+    return false;
+}
+
+// ---------- ROLE WHITELIST ----------
+function getWhitelistRoles(guildId) {
+    return getGuild(guildId).whitelistRoles;
+}
+
+function addWhitelistRole(guildId, roleId) {
+    const rl = getWhitelistRoles(guildId);
+    if (!rl.includes(roleId)) {
+        rl.push(roleId);
+        saveSettings();
+        return true;
+    }
+    return false;
+}
+
+function removeWhitelistRole(guildId, roleId) {
+    const g = getGuild(guildId);
+    const before = g.whitelistRoles.length;
+    g.whitelistRoles = g.whitelistRoles.filter(id => id !== roleId);
+    if (g.whitelistRoles.length < before) {
+        saveSettings();
+        return true;
+    }
+    return false;
+}
+
+// ---------- UNIFIED CHECK ----------
+// A user is whitelisted if:
+//   1. Their ID is in the env WHITELISTED_USERS list, OR
+//   2. Their ID is in the guild's /whitelist list, OR
+//   3. They have a role that is in the guild's /whitelist-roles list
+function isWhitelisted(guild, userId) {
+    if (CONFIG.ENV_WHITELISTED_USERS.has(userId)) return true;
+    if (getWhitelist(guild.id).includes(userId)) return true;
+
+    const member = guild.members.cache.get(userId);
+    if (member) {
+        const roles = getWhitelistRoles(guild.id);
+        if (roles.length && member.roles.cache.some(r => roles.includes(r.id))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 loadSettings();
 
 // ============================================================
 // IN-MEMORY STORES
 // ============================================================
 const rateLimitMap = new Map();
-const slowBurnMap  = new Map();
+const slowBurnMap = new Map();
 const ghostEventMap = new Map();
 
 // ============================================================
@@ -199,7 +281,16 @@ async function punishUser(guild, userId, reason, isBetrayal = false) {
         if (member.id === guild.ownerId || member.id === client.user.id) return;
         if (CONFIG.ABSOLUTE_IMMUNE.has(member.id)) return;
 
-        if (isBetrayal) CONFIG.WHITELISTED_USERS.delete(member.id);
+        // Anti-betray: strip whitelist privilege AND role whitelist membership
+        if (isBetrayal) {
+            removeWhitelist(guild.id, member.id);
+            // Also remove any whitelisted roles this user has
+            const wlRoles = getWhitelistRoles(guild.id);
+            const toRemove = member.roles.cache.filter(r => wlRoles.includes(r.id));
+            if (toRemove.size > 0) {
+                await member.roles.remove(toRemove, '[AxeSecurity] Betrayal — removing whitelist roles').catch(() => {});
+            }
+        }
 
         if (CONFIG.PUNISHMENT === 'ban') {
             await member.ban({ reason: `[AxeSecurity] ${reason}` });
@@ -257,7 +348,7 @@ const client = new Client({
 });
 
 // ============================================================
-// SLASH COMMAND DEFINITIONS
+// SLASH COMMANDS
 // ============================================================
 const commandDefs = [
     new SlashCommandBuilder()
@@ -277,6 +368,32 @@ const commandDefs = [
         .setName('panic')
         .setDescription('Disable ALL protection features (emergency)')
         .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
+
+    new SlashCommandBuilder()
+        .setName('whitelist')
+        .setDescription('Manage the user whitelist')
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
+        .addSubcommand(sub => sub
+            .setName('add').setDescription('Add a user to the whitelist')
+            .addUserOption(o => o.setName('user').setDescription('User to whitelist').setRequired(true)))
+        .addSubcommand(sub => sub
+            .setName('remove').setDescription('Remove a user from the whitelist')
+            .addUserOption(o => o.setName('user').setDescription('User to remove').setRequired(true)))
+        .addSubcommand(sub => sub
+            .setName('list').setDescription('Show all whitelisted users')),
+
+    new SlashCommandBuilder()
+        .setName('whitelist-roles')
+        .setDescription('Manage the role whitelist (immunity for every member with that role)')
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
+        .addSubcommand(sub => sub
+            .setName('add').setDescription('Add a role to the whitelist')
+            .addRoleOption(o => o.setName('role').setDescription('Role to whitelist').setRequired(true)))
+        .addSubcommand(sub => sub
+            .setName('remove').setDescription('Remove a role from the whitelist')
+            .addRoleOption(o => o.setName('role').setDescription('Role to remove').setRequired(true)))
+        .addSubcommand(sub => sub
+            .setName('list').setDescription('Show all whitelisted roles')),
 ];
 
 // ============================================================
@@ -308,6 +425,7 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: '❌ Administrator only.', ephemeral: true });
     }
 
+    // ---------- /toggle ----------
     if (interaction.commandName === 'toggle') {
         const feature = interaction.options.getString('feature');
         const state = toggleFeature(guild.id, feature);
@@ -320,6 +438,7 @@ client.on('interactionCreate', async (interaction) => {
         });
     }
 
+    // ---------- /features ----------
     if (interaction.commandName === 'features') {
         const g = getGuild(guild.id);
         const lines = Object.entries(FEATURES).map(([k, m]) =>
@@ -335,6 +454,7 @@ client.on('interactionCreate', async (interaction) => {
         });
     }
 
+    // ---------- /panic ----------
     if (interaction.commandName === 'panic') {
         panicDisableAll(guild.id);
         return interaction.reply({
@@ -345,11 +465,147 @@ client.on('interactionCreate', async (interaction) => {
             ephemeral: true,
         });
     }
+
+    // ---------- /whitelist ----------
+    if (interaction.commandName === 'whitelist') {
+        const sub = interaction.options.getSubcommand();
+
+        if (sub === 'add') {
+            const user = interaction.options.getUser('user');
+            if (user.id === guild.ownerId) {
+                return interaction.reply({
+                    content: 'ℹ️ The server owner is always immune, no need to whitelist.',
+                    ephemeral: true,
+                });
+            }
+            const added = addWhitelist(guild.id, user.id);
+            return interaction.reply({
+                embeds: [new EmbedBuilder()
+                    .setColor(added ? 0x00FF00 : 0xFFA500)
+                    .setTitle(added ? '✅ Added to whitelist' : 'ℹ️ Already whitelisted')
+                    .setDescription(`**User:** ${user.tag} (\`${user.id}\`)`)
+                    .setTimestamp()],
+                ephemeral: true,
+            });
+        }
+
+        if (sub === 'remove') {
+            const user = interaction.options.getUser('user');
+            if (CONFIG.ENV_WHITELISTED_USERS.has(user.id)) {
+                return interaction.reply({
+                    content: `⚠️ **${user.tag}** is in the permanent env whitelist (\`WHITELISTED_USERS\`). Remove them from Render env vars and redeploy.`,
+                    ephemeral: true,
+                });
+            }
+            const removed = removeWhitelist(guild.id, user.id);
+            return interaction.reply({
+                embeds: [new EmbedBuilder()
+                    .setColor(removed ? 0x00FF00 : 0xFFA500)
+                    .setTitle(removed ? '✅ Removed from whitelist' : 'ℹ️ Not whitelisted')
+                    .setDescription(`**User:** ${user.tag} (\`${user.id}\`)`)
+                    .setTimestamp()],
+                ephemeral: true,
+            });
+        }
+
+        if (sub === 'list') {
+            const wl = getWhitelist(guild.id);
+            const envWl = [...CONFIG.ENV_WHITELISTED_USERS];
+            const all = [...new Set([...envWl, ...wl])];
+
+            if (all.length === 0) {
+                return interaction.reply({ content: '📋 Whitelist is empty.', ephemeral: true });
+            }
+
+            const lines = await Promise.all(all.map(async id => {
+                const user = await client.users.fetch(id).catch(() => null);
+                const tag = user ? `**${user.tag}**` : '`unknown`';
+                const source = envWl.includes(id) ? ' *(env)*' : '';
+                return `• ${tag} (\`${id}\`)${source}`;
+            }));
+
+            return interaction.reply({
+                embeds: [new EmbedBuilder()
+                    .setColor(0x5865F2)
+                    .setTitle(`📋 User Whitelist — ${all.length} user(s)`)
+                    .setDescription(lines.join('\n'))
+                    .setTimestamp()],
+                ephemeral: true,
+            });
+        }
+    }
+
+    // ---------- /whitelist-roles ----------
+    if (interaction.commandName === 'whitelist-roles') {
+        const sub = interaction.options.getSubcommand();
+
+        if (sub === 'add') {
+            const role = interaction.options.getRole('role');
+            if (role.id === guild.roles.everyone.id) {
+                return interaction.reply({
+                    content: '❌ Cannot whitelist @everyone — that would whitelist every member.',
+                    ephemeral: true,
+                });
+            }
+            if (role.managed) {
+                return interaction.reply({
+                    content: `ℹ️ **${role.name}** is a managed role (bot/integration). It will still work as a whitelist trigger, but you can't manually assign it. Adding anyway.`,
+                    ephemeral: true,
+                }).then(() => {});
+            }
+            const added = addWhitelistRole(guild.id, role.id);
+            return interaction.reply({
+                embeds: [new EmbedBuilder()
+                    .setColor(added ? 0x00FF00 : 0xFFA500)
+                    .setTitle(added ? '✅ Role added to whitelist' : 'ℹ️ Role already whitelisted')
+                    .setDescription(`**Role:** ${role.name} (\`${role.id}\`)\nEvery member with this role is now immune.`)
+                    .setTimestamp()],
+                ephemeral: true,
+            });
+        }
+
+        if (sub === 'remove') {
+            const role = interaction.options.getRole('role');
+            const removed = removeWhitelistRole(guild.id, role.id);
+            return interaction.reply({
+                embeds: [new EmbedBuilder()
+                    .setColor(removed ? 0x00FF00 : 0xFFA500)
+                    .setTitle(removed ? '✅ Role removed from whitelist' : 'ℹ️ Role not whitelisted')
+                    .setDescription(`**Role:** ${role.name} (\`${role.id}\`)`)
+                    .setTimestamp()],
+                ephemeral: true,
+            });
+        }
+
+        if (sub === 'list') {
+            const roles = getWhitelistRoles(guild.id);
+            if (roles.length === 0) {
+                return interaction.reply({ content: '📋 Role whitelist is empty.', ephemeral: true });
+            }
+
+            const lines = roles.map(id => {
+                const role = guild.roles.cache.get(id);
+                return role
+                    ? `• **${role.name}** (\`${id}\`) — ${role.members.size} member(s)`
+                    : `• \`${id}\` (deleted role)`;
+            });
+
+            return interaction.reply({
+                embeds: [new EmbedBuilder()
+                    .setColor(0x5865F2)
+                    .setTitle(`📋 Role Whitelist — ${roles.length} role(s)`)
+                    .setDescription(lines.join('\n'))
+                    .setTimestamp()],
+                ephemeral: true,
+            });
+        }
+    }
 });
 
 // ============================================================
 // ANTI-NUKE EVENTS
 // ============================================================
+
 client.on('channelDelete', async (channel) => {
     if (!channel.guild) return;
     const guild = channel.guild;
@@ -359,7 +615,7 @@ client.on('channelDelete', async (channel) => {
     const executor = await getExecutor(guild, AuditLogEvent.ChannelDelete, channel.id);
     if (!executor || CONFIG.ABSOLUTE_IMMUNE.has(executor.id)) return;
 
-    const whitelisted = CONFIG.WHITELISTED_USERS.has(executor.id);
+    const whitelisted = isWhitelisted(guild, executor.id);
 
     if (isEnabled(guild.id, 'antiBetray') && whitelisted
         && isRateLimited(guild.id, executor.id, 'channelDelete')) {
@@ -382,7 +638,7 @@ client.on('roleDelete', async (role) => {
     const executor = await getExecutor(guild, AuditLogEvent.RoleDelete, role.id);
     if (!executor || CONFIG.ABSOLUTE_IMMUNE.has(executor.id)) return;
 
-    const whitelisted = CONFIG.WHITELISTED_USERS.has(executor.id);
+    const whitelisted = isWhitelisted(guild, executor.id);
     if (isEnabled(guild.id, 'antiBetray') && whitelisted
         && isRateLimited(guild.id, executor.id, 'roleDelete')) {
         return punishUser(guild, executor.id, 'Betrayal: Mass Role Deletion', true);
@@ -419,7 +675,7 @@ client.on('roleUpdate', async (oldRole, newRole) => {
     await newRole.setPermissions(oldRole.permissions,
         '[AxeSecurity] Reverting dangerous permissions').catch(() => {});
 
-    const whitelisted = CONFIG.WHITELISTED_USERS.has(executor.id);
+    const whitelisted = isWhitelisted(guild, executor.id);
     await punishUser(guild, executor.id,
         whitelisted ? 'Betrayal: Granting Dangerous Permissions' : 'Granting Dangerous Permissions',
         whitelisted);
@@ -432,7 +688,7 @@ client.on('guildBanAdd', async (ban) => {
     const executor = await getExecutor(guild, AuditLogEvent.MemberBanAdd, ban.user.id);
     if (!executor || CONFIG.ABSOLUTE_IMMUNE.has(executor.id)) return;
 
-    const whitelisted = CONFIG.WHITELISTED_USERS.has(executor.id);
+    const whitelisted = isWhitelisted(guild, executor.id);
     if (isEnabled(guild.id, 'antiBetray') && whitelisted
         && isRateLimited(guild.id, executor.id, 'memberBan')) {
         return punishUser(guild, executor.id, 'Betrayal: Mass Ban', true);
@@ -461,7 +717,7 @@ client.on('guildMemberAdd', async (member) => {
     if (!executor || CONFIG.ABSOLUTE_IMMUNE.has(executor.id)) return;
     if (executor.id === guild.ownerId) return;
 
-    const whitelisted = CONFIG.WHITELISTED_USERS.has(executor.id);
+    const whitelisted = isWhitelisted(guild, executor.id);
     await punishUser(guild, executor.id,
         whitelisted ? 'Betrayal: Inviting Unauthorized Bot' : 'Unauthorized Bot Addition',
         whitelisted);
@@ -510,7 +766,7 @@ client.on('webhookUpdate', async (channel) => {
         const executor = await getExecutor(guild, AuditLogEvent.WebhookCreate, webhook.id);
         if (!executor || CONFIG.ABSOLUTE_IMMUNE.has(executor.id)) continue;
 
-        const whitelisted = CONFIG.WHITELISTED_USERS.has(executor.id);
+        const whitelisted = isWhitelisted(guild, executor.id);
         await punishUser(guild, executor.id,
             whitelisted ? 'Betrayal: Creating Webhook' : 'Unauthorized Webhook Creation',
             whitelisted);
